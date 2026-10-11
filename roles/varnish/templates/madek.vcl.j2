@@ -1,0 +1,421 @@
+vcl 4.1;
+#
+# {{ ansible_managed | default('Managed with ansible') }} - roles/varnish/templates/madek.vcl.j2
+#
+# Madek webapp: shared cache for ANONYMOUS GET/HEAD requests.
+#
+#   Apache (TLS, :443) [-> Anubis] -> Varnish (127.0.0.1:{{ varnish_port }}) -> Puma ({{ varnish_backend_host }}:{{ varnish_backend_port }})
+#
+# Needs no change to Madek. Self-contained: only vmod_std (part of Varnish Cache core),
+# no varnish-modules, so it runs on the plain Debian `varnish` 7.x package.
+# Policy values (TTL, grace, probe, ...) are role variables, see roles/varnish/defaults/main.yml.
+#
+# Rules in one paragraph:
+#   * Anything carrying the `{{ varnish_session_cookie_name }}` cookie (= signed in), an Authorization
+#     header, a non-GET/HEAD method, a token-bearing URL or a per-user/binary path is PASSed untouched.
+#   * Every other GET/HEAD is anonymous: the Cookie header is dropped before the backend sees it,
+#     the URL is normalised (sorted query, junk params removed, `lang=de` = default locale removed),
+#     `Accept` is folded to text/html | application/json (Madek answers `Vary: Accept`), and
+#     200/301/302/404 answers are stored for the TTL with Set-Cookie removed. A backend `no-store`
+#     is never stored, a backend `s-maxage` sets the TTL.
+#   * 5xx is never stored. If a fetch fails (5xx or backend error) and an older copy is still in
+#     the cache (grace), the older copy is served instead ("stale-if-error").
+#   * Every anonymous answer leaves Varnish as `Cache-Control: max-age=0, private, must-revalidate`,
+#     so no cache behind it (Apache mod_cache, browsers) stores a shared copy.
+#
+# Lines tagged `@cfg` carry the role variables; keep the tags when editing.
+
+import std;
+{% if varnish_presentation_params_redirect | bool %}
+
+{% include 'vcl/presentation-params.vcl.j2' %}
+{% endif %}
+{% if varnish_list_param_bounds | bool %}
+
+{% include 'vcl/list-param-bounds.vcl.j2' %}
+{% endif %}
+
+###############################################################################
+### CONSTANTS #################################################################
+###############################################################################
+
+# Request-side constants. Called first thing in vcl_recv.
+sub madek_cfg_recv {
+    # "1": add `X-Cache-Key: <normalised url>` and `X-Madek-Cache` to responses (verification).
+    set req.http.X-Madek-Debug = "{{ '1' if (varnish_debug_headers | bool)  else '0' }}";                # @cfg DEBUG
+
+    # The authentication cookie. `madek-session` (dash) is validated against `user_sessions` by
+    # datalayer's MadekCookieSession. NOT to be confused with `_madek_session` (underscore), the
+    # Rails session cookie that is set on every anonymous HTML response for the CSRF token only.
+    if (req.http.Cookie ~ "(^|;\s*){{ varnish_session_cookie_name | regex_escape }}=") {     # @cfg SESSION_COOKIE
+        set req.http.X-Madek-Authenticated = "1";
+    }
+}
+
+# Grace used at lookup while the backend is healthy (= stale-while-revalidate window):
+# an object up to this far past its TTL is delivered at once and refreshed in the background.
+sub madek_cfg_grace_healthy {
+    set req.grace = {{ varnish_grace_healthy }};                                # @cfg SWR
+}
+
+# Object lifetimes for cacheable anonymous responses. Called in vcl_backend_response.
+sub madek_cfg_ttl {
+    # Fresh lifetime (a backend `s-maxage` overrides it, see vcl_backend_response).
+    # Freshness of edits matters more than the TTL: longer TTLs buy little extra hit rate.
+    set beresp.ttl = {{ varnish_ttl }};                                         # @cfg TTL
+    # How long a stale copy is kept for stale-if-error / sick-backend mode.
+    # Lookups only use it when the backend is sick or a fetch just failed (see vcl_recv/vcl_synth).
+    set beresp.grace = {{ varnish_grace }};                                     # @cfg GRACE
+    # `keep` only helps conditional re-fetches (304). Upstream Madek's ETag is a digest of the
+    # body and the body differs on every render (masked CSRF token), so Puma never answers 304.
+    set beresp.keep = {{ varnish_keep }};                                       # @cfg KEEP
+}
+
+###############################################################################
+### BACKENDS ##################################################################
+###############################################################################
+
+# Traffic backend: NO probe. A probe-sick backend is not used for fetches at all, which would turn
+# every pass (= every signed-in user) into an instant 503 while Puma is merely slow.
+backend webapp {
+    .host = "{{ varnish_backend_host }}";                                       # @cfg BACKEND_HOST
+    .port = "{{ varnish_backend_port }}";                                       # @cfg BACKEND_PORT
+    .connect_timeout = 2s;
+    .first_byte_timeout = {{ varnish_first_byte_timeout }};                     # @cfg FIRST_BYTE_TIMEOUT
+    .between_bytes_timeout = {{ varnish_first_byte_timeout }};                  # @cfg FIRST_BYTE_TIMEOUT
+}
+
+# Same Puma, used ONLY for std.healthy(): decides whether stale objects may be served for the whole
+# grace period (sick) or only the short SWR window (healthy). Never receives traffic itself.
+# GET /status is a trivial ApplicationController action (plain text "OK ...").
+backend webapp_health {
+    .host = "{{ varnish_backend_host }}";                                       # @cfg BACKEND_HOST
+    .port = "{{ varnish_backend_port }}";                                       # @cfg BACKEND_PORT
+    .probe = {
+        .url = "{{ varnish_probe_url }}";                                       # @cfg PROBE_URL
+        # Policy choice (role variable varnish_probe_timeout): a long timeout means only a stuck
+        # Puma counts as sick; a short one turns slow periods into load shedding with old pages.
+        .timeout = {{ varnish_probe_timeout }};                                 # @cfg PROBE_TIMEOUT
+        .interval = {{ varnish_probe_interval }};                               # @cfg PROBE_INTERVAL
+        .window = 6;
+        .threshold = 3;      # sick after 4 of the last 6 probes failed
+        .initial = 3;        # start healthy
+    }
+}
+
+###############################################################################
+### RECV ######################################################################
+###############################################################################
+
+sub vcl_recv {
+    if (req.restarts == 0) {
+        # never trust internal marker headers from clients
+        unset req.http.X-Madek-Anon;
+        unset req.http.X-Madek-Authenticated;
+        unset req.http.X-Madek-Stale-If-Error;
+        unset req.http.X-Madek-State;
+        unset req.http.X-Madek-Debug;
+        # @cfg FEATURE_MARKERS
+{% if varnish_presentation_params_redirect | bool %}
+        unset req.http.X-Madek-Presentation;
+        unset req.http.X-Madek-List-Cookie;
+{% endif %}
+{% if varnish_list_param_bounds | bool %}
+        unset req.http.X-Madek-List-Url;
+{% endif %}
+    }
+    # X-Forwarded-For: Varnish core appends client.ip (= Apache) to the X-Forwarded-For that Apache
+    # set (ProxyAddHeaders On), before vcl_recv runs. Rails' remote_ip skips the trusted proxy
+    # addresses (127/8, 10/8, 172.16/12, ...), so the client IP is preserved. Nothing to do here.
+    call madek_cfg_recv;
+    set req.backend_hint = webapp;
+
+    # ---- PASS: never cached, request forwarded unchanged (cookies included) -------------------
+    if (req.method != "GET" && req.method != "HEAD") {
+        return (pass);                # POST/PUT/PATCH/DELETE (+ zencoder callbacks, sign out, ...)
+    }
+
+    # Optional features. They see every GET/HEAD with the raw URL and skip signed-in requests
+    # themselves (X-Madek-Authenticated / Authorization).
+    # @cfg PRESENTATION_PARAMS_REDIRECT  (302 away from list[layout|show_filter|accordion])
+{% if varnish_presentation_params_redirect | bool %}
+    call madek_presentation_params_redirect;
+{% endif %}
+    # @cfg LIST_PARAM_BOUNDS  (reject absurd list[page] / list[per_page])
+{% if varnish_list_param_bounds | bool %}
+    call madek_list_param_bounds;
+{% endif %}
+
+    if (req.http.Authorization || req.http.X-Madek-Authenticated) {
+        return (pass);                # signed-in users / API-style auth
+    }
+    if (req.url ~ "^/(auth|api|api-v2|admin|in-admin|my|session|status|media|files|zencoder_jobs|\.within\.website)(/|\?|\.|$)") {
+        # /auth /api /admin are separate services in production (never reach this Varnish),
+        # passed defensively. /my*, /session* are per-user. /status is the health check (a cached
+        # "OK" would hide a dead webapp from monitoring). /media (previews) and /files are binary
+        # downloads streamed by Apache X-Sendfile; caching them is out of scope (and the preview
+        # controller reads confidential-link tokens from the Referer).
+        return (pass);
+    }
+    if (req.url ~ "^/(entries|media_entries)/[^/?]+/(image|video|audio|document)\.") {
+        return (pass);                # binary media endpoints
+    }
+    if (req.url ~ "^/(entries|media_entries|sets|collections)/[^/?]+/(access/|embedded|fullscreen)") {
+        # confidential-link pages (token in path) and embed views (embedded uses the Referer host
+        # in the body: embed_helper.rb#referer_info)
+        return (pass);
+    }
+    if (req.url ~ "[?&](access|accessToken|token)=") {
+        # confidential-link tokens as query params (controller_helpers.rb#get_access_token_from_params).
+        # Keyed by URL this would be correct, but a cached copy would outlive a revoked link.
+        return (pass);
+    }
+    if (req.http.User-Agent ~ "NOJSPLZ") {
+        return (pass);                # test hook in ApplicationController#use_js (no-JS rendering)
+    }
+
+    # ---- ANONYMOUS, CACHEABLE ------------------------------------------------------------------
+    set req.http.X-Madek-Anon = "1";
+    # Drop all cookies: `_madek_session` only carries the CSRF secret for anonymous users,
+    # Anubis' pass cookie (Anubis sits in front) is irrelevant for Puma, analytics cookies
+    # likewise. Puma never sees a cookie, so the response cannot depend on one.
+    unset req.http.Cookie;
+
+    # Accept: Madek answers `Vary: Accept` (HTML vs JSON for the same URL). Varnish matches Vary by
+    # exact header string, so crawler/browser Accept variety would fragment the cache. Fold to the
+    # two values the app actually distinguishes; anything exotic is kept verbatim (own variant).
+    if (req.http.Accept ~ "application/json" && req.http.Accept !~ "text/html") {
+        set req.http.Accept = "application/json";
+    } elsif (!req.http.Accept || req.http.Accept ~ "text/html|\*/\*|application/xhtml") {
+        set req.http.Accept = "text/html";
+    }
+    # Accept-Encoding: Varnish (http_gzip_support=on) normalises it itself and stores gzip.
+    # Accept-Language: ignored by Madek (locale comes from ?lang= only), so not part of the key.
+
+    call madek_normalize_url;
+    # @cfg PRESENTATION_PARAMS_COOKIE  (no-JS preference cookie -> list params for the backend)
+{% if varnish_presentation_params_redirect | bool %}
+    call madek_presentation_params_cookie;
+{% endif %}
+
+    if (req.http.X-Madek-Stale-If-Error) {
+        # restarted after a failed fetch (see vcl_synth): accept any copy within the object's grace
+        set req.grace = {{ varnish_grace }};                                    # @cfg GRACE
+    } elsif (std.healthy(webapp_health)) {
+        call madek_cfg_grace_healthy;
+    }
+    # else: backend sick -> req.grace stays unset -> the object's full grace applies
+    # (pattern from the Varnish users guide, "Grace mode and keep", section "Misbehaving servers")
+    return (hash);
+}
+
+# Canonical percent-encoding of brackets: list[page] == list%5Bpage%5D == list%5bpage%5d
+# (Rails decodes all three alike; Madek's own links use %5B/%5D)
+sub madek_canonical_brackets {
+    set req.url = regsuball(req.url, "\[", "%5B");
+    set req.url = regsuball(req.url, "\]", "%5D");
+    set req.url = regsuball(req.url, "%5b", "%5B");
+    set req.url = regsuball(req.url, "%5d", "%5D");
+}
+
+# Query-string normalisation. Rewrites req.url itself, so Puma renders exactly the normalised URL
+# (e.g. a `___norender=1` request can never store an SSR-less page under the shared key).
+sub madek_normalize_url {
+    if (req.url !~ "\?") {
+        return;
+    }
+    call madek_canonical_brackets;
+
+    # junk / internal params:
+    #   ___*  except ___sparse: ___norender only switches SSR off (client renders the same props);
+    #         ___sparse is NOT junk -- ApplicationResponder#sparse_request_spec_from_param selects
+    #         the dumped fields with it, so it changes the JSON body and must stay in the key.
+    #   utm_*, fbclid, gclid, msclkid, mc_cid, mc_eid, _ga: tracking
+    set req.url = regsuball(req.url, "([?&])(___(?!sparse(=|&|$))[^=&]*|utm_[^=&]*|fbclid|gclid|msclkid|mc_cid|mc_eid|_ga)(=[^&]*)?(?=&|$)", "\1");
+    # lang=de is the default locale (AppSetting.default_locale = 'de' by default, see
+    # datalayer/config/settings.yml); LangParams falls back to the default when lang is absent.
+    set req.url = regsuball(req.url, "([?&])lang=de(?=&|$)", "\1");
+    # empty params: `a=` and bare `a`
+    set req.url = regsuball(req.url, "([?&])[^=&]+=(?=&|$)", "\1");
+    set req.url = regsuball(req.url, "([?&])[^=&]+(?=&|$)", "\1");
+
+    call madek_tidy_query;
+}
+
+# tidy separators left by the removals above, then sort
+sub madek_tidy_query {
+    set req.url = regsuball(req.url, "&&+", "&");
+    set req.url = regsub(req.url, "\?&", "?");
+    set req.url = regsub(req.url, "[?&]$", "");
+    set req.url = std.querysort(req.url);
+}
+
+sub vcl_hash {
+    hash_data(req.url);              # normalised; contains lang=en when relevant
+    if (req.http.host) {
+        hash_data(req.http.host);
+    } else {
+        hash_data(server.ip);
+    }
+    # Rails builds absolute URLs (canonical/og links, redirects) from these headers that Apache sets
+    hash_data("" + req.http.X-Forwarded-Host);
+    hash_data("" + req.http.X-Forwarded-Proto);
+    # Accept is handled through the response's `Vary: Accept` (normalised above).
+    return (lookup);
+}
+
+sub vcl_hit {
+    if (obj.ttl >= 0s) {
+        set req.http.X-Madek-State = "fresh";
+    } elsif (req.http.X-Madek-Stale-If-Error) {
+        set req.http.X-Madek-State = "stale-if-error";
+    } else {
+        set req.http.X-Madek-State = "grace";   # stale-while-revalidate: a background fetch runs
+    }
+    return (deliver);
+}
+
+sub vcl_miss {
+    if (req.http.X-Madek-Stale-If-Error) {
+        # A fetch for this key just failed and there is no stale copy: do not hit the failing
+        # backend a second time for the same client request.
+        return (synth(503, "Backend error, no cached copy"));
+    }
+    if (req.is_hitmiss) {
+        set req.http.X-Madek-State = "hitmiss";
+    } else {
+        set req.http.X-Madek-State = "miss";
+    }
+    return (fetch);
+}
+
+sub vcl_pass {
+    set req.http.X-Madek-State = "pass";
+    return (fetch);
+}
+
+###############################################################################
+### BACKEND ###################################################################
+###############################################################################
+
+sub vcl_backend_response {
+    if (bereq.http.X-Madek-Anon != "1") {
+        return (deliver);    # pass traffic: response untouched (Set-Cookie etc. go to the user)
+    }
+
+    # Anonymous request. Puma never saw a cookie, so whatever session it created is useless:
+    # strip it on every anonymous response (stored or not). A HIT can therefore never carry one.
+    unset beresp.http.Set-Cookie;
+
+    if (beresp.status >= 500) {
+        # Never store 5xx. Keep/serve the stale copy instead (doc pattern for background fetches);
+        # for a foreground fetch, abandon -> client gets 503 in vcl_synth -> restart with full grace
+        # -> stale copy if one exists, else a synthetic 503 (vcl_miss).
+        return (abandon);
+    }
+
+    # The backend marks a response "never store" (SSR fallback page, confidential or per-request
+    # content on a patched webapp): never store it. `private` ALONE is ignored on purpose: the
+    # webapp sends `max-age=0, private, must-revalidate` on every page by default, and anonymous
+    # requests reach it without cookies, so that `private` carries no information here.
+    if (beresp.http.Cache-Control ~ "(?i)(^|,)\s*no-store\s*(,|$)") {
+        if (bereq.is_bgfetch) {
+            return (abandon);        # keep the good stale copy instead of a hit-for-miss marker
+        }
+        set beresp.ttl = 10s;        # hit-for-miss, as for 4xx below
+        set beresp.grace = 0s;
+        set beresp.uncacheable = true;
+        return (deliver);
+    }
+
+    if (beresp.status == 200 || beresp.status == 301 || beresp.status == 302 || beresp.status == 404) {
+        # Puma says `Cache-Control: max-age=0, private, must-revalidate`; beresp.ttl below overrides
+        # that for Varnish only. vcl_deliver hands the same header downstream.
+        call madek_cfg_ttl;
+        # A backend that sends `s-maxage` (shared-cache lifetime) decides the TTL itself.
+        if (beresp.http.Cache-Control ~ "(?i)(^|,)\s*s-maxage=[0-9]+") {
+            set beresp.ttl = std.duration(regsub(beresp.http.Cache-Control,
+                "(?i)^.*s-maxage=([0-9]+).*$", "\1s"), {{ varnish_ttl }});       # @cfg TTL
+        }
+        set beresp.http.X-Madek-Cache = "anon";      # the deploy ban matches on this
+        if (beresp.http.Content-Type ~ "^(text/html|application/json)" && !beresp.http.Content-Encoding) {
+            set beresp.do_gzip = true;   # store compressed (~1/4 of the size); gunzipped for clients that need it
+        }
+        return (deliver);
+    }
+
+    # Anything else (401/403/400/422 ...): do not store; short hit-for-miss so that requests to this
+    # key are not coalesced/serialised, without blocking the key for the builtin 120 s.
+    set beresp.ttl = 10s;
+    set beresp.grace = 0s;
+    set beresp.uncacheable = true;
+    return (deliver);
+}
+
+sub vcl_backend_error {
+    # connection refused / timeout. Same treatment as 5xx for anonymous requests.
+    if (bereq.is_bgfetch || bereq.http.X-Madek-Anon == "1") {
+        return (abandon);
+    }
+    # pass traffic: builtin synthetic 503
+}
+
+###############################################################################
+### CLIENT SIDE ###############################################################
+###############################################################################
+
+sub vcl_synth {
+    # @cfg FEATURE_SYNTH  (751 = presentation-params redirect, 752 = list parameter out of range)
+{% if varnish_presentation_params_redirect | bool %}
+    call madek_presentation_params_synth;
+{% endif %}
+{% if varnish_list_param_bounds | bool %}
+    call madek_list_param_bounds_synth;
+{% endif %}
+    if (resp.status == 503 && req.http.X-Madek-Anon == "1" && !req.http.X-Madek-Stale-If-Error
+        && req.restarts == 0 && req.http.X-Madek-State != "pass") {
+        # the fetch for an anonymous request failed/was abandoned: look again, accepting stale
+        set req.http.X-Madek-Stale-If-Error = "1";
+        return (restart);
+    }
+    if (resp.status == 503) {
+        set resp.http.Retry-After = "30";
+        set resp.http.Content-Type = "text/html; charset=utf-8";
+        set resp.http.X-Cache = "MISS";
+        set resp.http.X-Cache-Detail = "error";
+        set resp.body = {"<!DOCTYPE html><html><head><title>503</title></head><body>
+<h1>Service temporarily unavailable</h1><p>Please try again in a moment.</p></body></html>"};
+        return (deliver);
+    }
+}
+
+sub vcl_deliver {
+    # X-Cache: HIT | MISS | PASS ;  X-Cache-Detail: fresh | grace | stale-if-error | miss | hitmiss | pass
+    #   grace (stale-while-revalidate) still triggered a backend request (background fetch).
+    if (req.http.X-Madek-State == "pass") {
+        set resp.http.X-Cache = "PASS";
+    } elsif (req.http.X-Madek-State ~ "^(fresh|grace|stale-if-error)$") {
+        set resp.http.X-Cache = "HIT";
+    } else {
+        set resp.http.X-Cache = "MISS";
+    }
+    set resp.http.X-Cache-Detail = req.http.X-Madek-State;
+    set resp.http.X-Cache-Hits = obj.hits;
+    # Age: set by Varnish itself (seconds since the object was fetched).
+    if (req.http.X-Madek-Anon == "1") {
+        unset resp.http.Set-Cookie;      # belt and braces: no Set-Cookie on any anonymous answer
+        if (resp.http.Cache-Control ~ "(?i)public|s-maxage|stale-") {
+            # Varnish is the shared cache. Apache behind us must not store the page a second
+            # time: the shipped mod_cache block (CacheQuickHandler on) would serve it to
+            # signed-in users before the webapp sees their cookie. Browsers treat this header
+            # the same as `public` for a cookieless GET, and ETag revalidation still works.
+            set resp.http.Cache-Control = "max-age=0, private, must-revalidate";
+        }
+        if (req.http.X-Madek-Debug == "1") {
+            set resp.http.X-Cache-Key = req.url;
+        }
+    }
+    if (req.http.X-Madek-Debug != "1") {
+        unset resp.http.X-Madek-Cache;   # the deploy ban tests obj.http, not the response
+    }
+}

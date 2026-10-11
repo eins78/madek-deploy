@@ -1,0 +1,20 @@
+- name: deploy varnish apache reverse proxy config
+  template:
+    src: reverse-proxy.conf
+    dest: /etc/apache2/madek/conf.d/madek_897_varnish.conf
+    mode: 0644
+  when: varnish_enabled | bool
+  register: varnish_proxy_deployed
+
+- name: remove varnish apache reverse proxy config
+  file:
+    path: /etc/apache2/madek/conf.d/madek_897_varnish.conf
+    state: absent
+  when: not (varnish_enabled | bool)
+  register: varnish_proxy_removed
+
+- name: reload reverse-proxy for varnish
+  service:
+    name: apache2
+    state: reloaded
+  when: varnish_proxy_deployed.changed or varnish_proxy_removed.changed

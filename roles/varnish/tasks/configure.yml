@@ -1,0 +1,30 @@
+- name: anubis must forward to varnish when both are enabled
+  assert:
+    that: anubis_target is search(':' ~ varnish_port ~ '(/|$)')
+    fail_msg: "anubis_enabled and varnish_enabled are both true, but anubis_target ({{ anubis_target }}) bypasses Varnish"
+  when: anubis_enabled | default(false) | bool
+
+# A VCL that does not compile never replaces the active one: the task fails,
+# the running Varnish keeps its VCL and Apache is not touched. `-j none`: the
+# compile check must read Ansible's root-only temp file, which the default
+# (unprivileged) jail cannot.
+- name: deploy varnish vcl
+  template:
+    src: madek.vcl.j2
+    dest: /etc/varnish/madek.vcl
+    mode: '0644'
+    validate: '/usr/sbin/varnishd -j none -C -f %s'
+  register: varnish_vcl
+
+- name: create varnish systemd drop-in directory
+  file:
+    path: /etc/systemd/system/varnish.service.d
+    state: directory
+    mode: '0755'
+
+- name: deploy varnish systemd drop-in
+  template:
+    src: systemd-dropin.conf
+    dest: /etc/systemd/system/varnish.service.d/madek.conf
+    mode: '0644'
+  register: varnish_dropin

@@ -1,0 +1,74 @@
+###############################################################################
+# Varnish - shared cache for anonymous GET/HEAD requests in front of the webapp
+# https://varnish-cache.org/
+###############################################################################
+
+# Set to true to put Varnish between Apache and the Madek webapp as a shared
+# cache for anonymous GET/HEAD requests. Serves repeated anonymous requests
+# from memory; in a crawler-weighted replay the webapp received about a quarter
+# fewer requests and spent a third less CPU per request (maintainers' perf
+# notes, 2026-10). Signed-in users (`madek-session` cookie), non-GET requests,
+# per-user paths and binary downloads always go to the webapp. Pages may be up
+# to `varnish_ttl` + `varnish_grace_healthy` old, and up to `varnish_grace` old
+# while the webapp fails. Off by default; off means the role installs and
+# writes nothing.
+varnish_enabled: false
+
+# Debian's package (7.x on Debian 12 and 13). The VCL uses only vmod_std.
+varnish_package: varnish
+
+# Listen and admin ports, bound to 127.0.0.1 only
+varnish_port: 6081
+varnish_admin_port: 6082
+
+# The webapp Varnish forwards to
+varnish_backend_host: "127.0.0.1"
+varnish_backend_port: "{{ madek_webapp_port }}"
+
+# Object storage (RAM). Expect RSS of roughly storage + transient + 100-150 MB.
+varnish_storage_size: 256m
+varnish_transient_size: 64m
+
+# Fresh lifetime of a stored anonymous page (a backend `s-maxage` overrides it)
+varnish_ttl: 10m
+# Stale-while-revalidate window while the webapp is healthy: edits show after ttl + this
+varnish_grace_healthy: 10s
+# How long a stale copy may be served while the webapp is sick or a fetch fails
+varnish_grace: 24h
+# Keep objects for conditional (304) re-fetches; 0 while every render differs
+varnish_keep: 0s
+
+# Health probe: decides only how old a page may be served (traffic never stops).
+# 30s = only a stuck webapp counts as sick; 5s = de-facto load shedding with old pages.
+varnish_probe_url: /status
+varnish_probe_timeout: 30s
+varnish_probe_interval: 10s
+
+# Same as Apache's default Timeout (300 s on Debian), so slow pages behave as without Varnish
+varnish_first_byte_timeout: 300s
+
+# The authentication cookie; requests carrying it are never cached.
+# Same value as the webapp's `madek_session_cookie_name` (webapp/config/settings.yml)
+# and datalayer's Madek::Constants::MADEK_SESSION_COOKIE_NAME.
+varnish_session_cookie_name: madek-session
+
+# Add X-Cache-Key (the normalised URL) and X-Madek-Cache to anonymous responses
+# (verification only)
+varnish_debug_headers: false
+
+# Ban all cached anonymous pages at the end of every deploy run
+varnish_ban_on_deploy: true
+
+# varnishd -p parameters. Header/URL limits match the Apache config
+# (LimitRequestLine 32760, LimitRequestFieldSize 32768 in madek_100_main.conf).
+varnish_params:
+  thread_pool_min: 50
+  thread_pool_max: 500
+  http_req_hdr_len: 32k
+  http_req_size: 64k
+  workspace_client: 128k
+  workspace_backend: 128k
+
+# Optional VCL features, off by default (= not rendered into the VCL)
+varnish_presentation_params_redirect: false
+varnish_list_param_bounds: false

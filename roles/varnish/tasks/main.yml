@@ -1,0 +1,16 @@
+- include_tasks: install.yml
+  when: varnish_enabled | bool
+
+- include_tasks: configure.yml
+  when: varnish_enabled | bool
+
+- include_tasks: service.yml
+  when: varnish_enabled | bool
+
+- include_tasks: reverse-proxy.yml
+
+- include_tasks: ban.yml
+  when: varnish_enabled | bool and varnish_ban_on_deploy | bool
+
+- include_tasks: disable.yml
+  when: not (varnish_enabled | bool)

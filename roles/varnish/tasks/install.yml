@@ -1,0 +1,20 @@
+- name: install varnish
+  apt:
+    name: "{{ varnish_package }}"
+    state: present
+
+- name: check varnish admin secret
+  stat:
+    path: /etc/varnish/secret
+  register: varnish_secret_file
+
+- name: generate varnish admin secret
+  shell: umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/varnish/secret
+  when: not varnish_secret_file.stat.exists
+
+- name: varnish admin secret is readable by root only
+  file:
+    path: /etc/varnish/secret
+    owner: root
+    group: root
+    mode: '0600'

@@ -1,0 +1,8 @@
+# Runs after the webapp deploy role: drop every cached anonymous page, so no
+# page rendered by the previous release is served. Lurker-friendly ban (tests
+# only obj.*), so it does not slow down lookups.
+- name: ban cached anonymous pages
+  command: >-
+    varnishadm -T 127.0.0.1:{{ varnish_admin_port }} -S /etc/varnish/secret
+    ban obj.http.X-Madek-Cache == anon
+  changed_when: true
