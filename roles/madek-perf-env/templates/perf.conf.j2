@@ -1,0 +1,5 @@
+# Managed with ansible (madek-perf-env): MADEK_PERF_* opt-in performance toggles
+[Service]
+{% for key, value in madek_perf_env | dictsort %}
+Environment="{{ key }}={{ value }}"
+{% endfor %}

@@ -1,0 +1,32 @@
+- name: create madek-webapp.service.d
+  file:
+    path: /etc/systemd/system/madek-webapp.service.d
+    state: directory
+    mode: 0755
+  when: madek_perf_env | length > 0
+
+- name: install MADEK_PERF_* drop-in for madek-webapp
+  template:
+    src: perf.conf.j2
+    dest: /etc/systemd/system/madek-webapp.service.d/perf.conf
+    mode: 0644
+  when: madek_perf_env | length > 0
+  register: madek_perf_env_installed
+
+- name: remove MADEK_PERF_* drop-in for madek-webapp
+  file:
+    path: /etc/systemd/system/madek-webapp.service.d/perf.conf
+    state: absent
+  when: madek_perf_env | length == 0
+  register: madek_perf_env_removed
+
+- name: reload systemd
+  systemd:
+    daemon_reload: yes
+  when: madek_perf_env_installed is changed or madek_perf_env_removed is changed
+
+- name: restart madek-webapp
+  service:
+    name: madek-webapp
+    state: restarted
+  when: madek_perf_env_installed is changed or madek_perf_env_removed is changed

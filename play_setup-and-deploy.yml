@@ -40,6 +40,8 @@
       tags: [admin-webapp]
     - role: ../webapp/deploy/roles/deploy
       tags: [webapp]
+    - role: madek-perf-env
+      tags: [perf-env, webapp]
     - role: ../auth/deploy/roles/deploy
       tags:  [auth]
     - role: ../mail/deploy/roles/deploy
