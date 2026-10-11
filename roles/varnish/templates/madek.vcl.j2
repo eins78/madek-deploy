@@ -61,7 +61,7 @@ sub madek_cfg_grace_healthy {
 # Object lifetimes for cacheable anonymous responses. Called in vcl_backend_response.
 sub madek_cfg_ttl {
     # Fresh lifetime (a backend `s-maxage` overrides it, see vcl_backend_response).
-    # Freshness of edits matters more than the TTL: longer TTLs buy little extra hit rate.
+    # Edits become visible after the TTL (+ SWR window); the hit rate grows only slowly with longer TTLs.
     set beresp.ttl = {{ varnish_ttl }};                                         # @cfg TTL
     # How long a stale copy is kept for stale-if-error / sick-backend mode.
     # Lookups only use it when the backend is sick or a fetch just failed (see vcl_recv/vcl_synth).

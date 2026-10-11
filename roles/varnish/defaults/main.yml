@@ -30,7 +30,7 @@ varnish_storage_size: 256m
 varnish_transient_size: 64m
 
 # Fresh lifetime of a stored anonymous page (a backend `s-maxage` overrides it)
-varnish_ttl: 10m
+varnish_ttl: 1h
 # Stale-while-revalidate window while the webapp is healthy: edits show after ttl + this
 varnish_grace_healthy: 10s
 # How long a stale copy may be served while the webapp is sick or a fetch fails
