@@ -4,6 +4,7 @@ reverse_proxy_ip_hash_seed: Null
 reverse_proxy_use_x_forwarded_for: false
 reverse_proxy_enable_cors: true
 reverse_proxy_desired_seo_bots: []
+reverse_proxy_robots_extra_rules: false  # extra Disallow rules in robots.txt (crawl surface)
 
 # ---------------------------------------------------------------------------
 # Geo whitelisting via DB-IP Lite Country (mod_maxminddb)
