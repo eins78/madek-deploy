@@ -32,6 +32,18 @@ Disallow: /*?*accordion=*
 Disallow: /*?*permissions=*
 Disallow: /*?*meta_data=*
 
+{% if reverse_proxy_robots_extra_rules | default(false) %}
+# Crawl surface: parameters that only re-scope a page, exports, confidential
+# links and per-page sign-in return links; only well-behaved bots read this file.
+# NOTE: `*` also matches percent-encoded keys (`list%5Bpage%5D=`), so the
+#       `list*=` rule above covers both spellings.
+Disallow: /*?*return-to=*
+Disallow: /*?*return_to=*
+Disallow: /*?*___*
+Disallow: /*?*accessToken=*
+Disallow: /*/meta_data
+
+{% endif %}
 Disallow: /api/*
 Allow: /api/docs/*
 {% endif %}
