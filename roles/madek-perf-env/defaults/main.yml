@@ -1,0 +1,5 @@
+# MADEK_PERF_* opt-in performance toggles for the webapp service, e.g.
+#   madek_perf_env:
+#     MADEK_PERF_ANON_HTTP_CACHE: "1"
+# Empty (default) = no systemd drop-in = upstream behaviour.
+madek_perf_env: {}
