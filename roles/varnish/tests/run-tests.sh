@@ -168,5 +168,43 @@ expect "still the old body" "$(grep -o '"n":[0-9]*' <<<"$BODY")" "$n_good"
 mode ok
 render "$TMP/base.vcl"; load base "$TMP/base.vcl"
 
+echo "== presentation params (varnish_presentation_params_redirect)"
+render "$TMP/p.vcl" '{"varnish_presentation_params_redirect": true}'; load p "$TMP/p.vcl"
+req '/sets/p1?list[layout]=list&list[page]=2'
+expect "presentation param: 302" "$CODE" 302
+expect "Location: clean URL, values in the fragment" "$(hdr Location)" "/sets/p1?list%5Bpage%5D=2#list%5Blayout%5D=list"
+expect "preference cookie" "$(hdr Set-Cookie)" "madek_list=list%5Blayout%5D%3Dlist; Path=/; Max-Age=2592000; SameSite=Lax"
+expect "redirect not storable" "$(hdr Cache-Control)" no-store
+expect "backend not asked" "$(count /sets/p1)" 0
+req '/sets/p1?list[layout]=list&list[page]=2'; expect "repeat: 302 again" "$CODE" 302
+req '/sets/p1?list%5bshow_filter%5d=true&list[accordion]={"a":true}&list%5Blayout%5D=tiles' -H 'X-Forwarded-Proto: https'
+expect "all three, mixed bracket spellings" "$(hdr Location)" '/sets/p1#list%5Blayout%5D=tiles&list%5Bshow_filter%5D=true&list%5Baccordion%5D=%7B%22a%22%3Atrue%7D'
+expect "cookie over https: Secure" "$(hdr Set-Cookie)" "madek_list=list%5Blayout%5D%3Dtiles%26list%5Bshow_filter%5D%3Dtrue%26list%5Baccordion%5D%3D%7B%22a%22%3Atrue%7D; Path=/; Max-Age=2592000; SameSite=Lax; Secure"
+req '/sets/p1?list[layout]=bogus'; expect "unknown layout: 302" "$CODE" 302
+expect "unknown layout: no cookie" "$(hdr Set-Cookie)" ""
+req '/sets/p2?list[layout]=list' -H 'Accept: application/json'; expect "JSON: not redirected" "$CODE" 200
+req '/sets/p2?list[layout]=list&___sparse=%7B%7D'; expect "___sparse: not redirected" "$CODE" 200
+req '/sets/p2?list[layout]=list' -H 'Cookie: madek-session=x'; expect "signed in: not redirected" "$CODE" 200
+expect "signed in: PASS" "$(hdr X-Cache)" PASS
+grep -q 'list\[layout\]=list' <<<"$BODY" && ok "signed in: URL untouched" || bad "signed-in url: $BODY"
+req '/sets/p2?list[layout]=&list[page]=3'; expect "empty value only: no redirect" "$CODE" 200
+req '/sets/p3'; req '/sets/p3'; expect "clean URL without cookie: HIT" "$(hdr X-Cache)" HIT
+req '/sets/p3' -H 'Cookie: madek_list=list%5Blayout%5D%3Dlist'
+expect "layout cookie: own variant, MISS" "$(hdr X-Cache)" MISS
+grep -q '"url":"/sets/p3?list%5Blayout%5D=list"' <<<"$BODY" && ok "backend got the layout from the cookie" || bad "backend url: $BODY"
+grep -q '"cookie":null' <<<"$BODY" && ok "backend saw no Cookie" || bad "backend saw cookie: $BODY"
+req '/sets/p3' -H 'Cookie: other=1; madek_list=list%5Blayout%5D=list'
+expect "same cookie, plain fragment form: HIT" "$(hdr X-Cache)" HIT
+expect "no Set-Cookie" "$(hdr Set-Cookie)" ""
+req '/sets/p3'; expect "no cookie: still the default variant" "$(hdr X-Cache-Key)" /sets/p3
+req '/sets/p3' -H 'Cookie: madek_list=list%5Blayout%5D%3Dlist%26list%5Baccordion%5D%3D%7B%7D'
+expect "accordion cookie: PASS" "$(hdr X-Cache)" PASS
+grep -q 'list%5Baccordion%5D=%7B%7D' <<<"$BODY" && ok "backend got the accordion" || bad "backend url: $BODY"
+expect "no Set-Cookie on anonymous PASS" "$(hdr Set-Cookie)" ""
+req '/sets/p3' -H 'Cookie: madek_list=list%5Bfilter%5D%3Dx'
+expect "foreign key in cookie ignored" "$(hdr X-Cache-Key)" /sets/p3
+req '/sets/p3' -H 'Cookie: madek_list=list%5Blayout%5D%3Dlist' -H 'Accept: application/json'
+grep -q '"url":"/sets/p3"' <<<"$BODY" && ok "JSON request ignores the cookie" || bad "backend url: $BODY"
+
 echo; echo "passed $PASS, failed $FAIL"
 [ $FAIL = 0 ]

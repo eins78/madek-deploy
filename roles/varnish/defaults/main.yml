@@ -69,6 +69,20 @@ varnish_params:
   workspace_client: 128k
   workspace_backend: 128k
 
-# Optional VCL features, off by default (= not rendered into the VCL)
+###############################################################################
+# Optional VCL features (default off = not rendered into the VCL)
+###############################################################################
+
+# Presentation-only list parameters (list[layout], list[show_filter],
+# list[accordion]): anonymous HTML requests that carry them get a 302 to the
+# same URL without them; the values travel in the URL fragment (restored by
+# the webapp's JavaScript) and in the `madek_list` preference cookie for
+# clients without JavaScript. Only one presentation of each list is rendered
+# and cached; a layout/show_filter cookie is part of the cache key, an
+# accordion cookie bypasses the cache. Needs the webapp's fragment reader.
 varnish_presentation_params_redirect: false
+# Lifetime of the `madek_list` preference cookie (seconds, 30 days)
+varnish_presentation_cookie_max_age: 2592000
+
+# Reject absurd list[page] / list[per_page] for anonymous requests (off = not rendered)
 varnish_list_param_bounds: false

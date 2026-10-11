@@ -1,0 +1,127 @@
+###############################################################################
+### PRESENTATION PARAMETERS (varnish_presentation_params_redirect) ############
+###############################################################################
+#
+# list[layout], list[show_filter] and list[accordion] only change how a list is shown, not what it
+# contains. Anonymous HTML requests that carry them get a 302 to the same URL without them; the
+# values travel in the URL fragment (the webapp's JavaScript restores them on the client) and in
+# the `madek_list` preference cookie for clients without JavaScript. Only one presentation of each
+# list is rendered and stored. JSON and ___sparse requests (the list box's own fetches) and
+# signed-in requests are never redirected.
+#
+#   GET /sets/x?list[layout]=list&list[page]=2
+#   -> 302  Location: /sets/x?list%5Bpage%5D=2#list%5Blayout%5D=list
+#           Set-Cookie: madek_list=list%5Blayout%5D%3Dlist; Path=/; Max-Age=...; SameSite=Lax[; Secure]
+#           Cache-Control: no-store
+#
+# The cookie value is the fragment with `=` and `&` percent-encoded, i.e. the form-encoding of
+# `list[layout]=list&list[show_filter]=true` (what Rack decodes it to). A request without
+# presentation parameters but with a valid cookie is rendered in that presentation: the cookie's
+# parameters are appended to the URL the backend sees (and therefore to the cache key, so a
+# layout/show_filter cookie yields at most 4 x 2 stored variants per URL); a cookie carrying
+# list[accordion] (unbounded) makes the request a pass.
+{% set madek_list_value_re = "^(list%5Blayout%5D=(grid|tiles|list|miniature)(&|$))?(list%5Bshow_filter%5D=(true|false)(&|$))?(list%5Baccordion%5D=[A-Za-z0-9%._~!*'()+-]+)?$" %}
+
+# Called in vcl_recv for every GET/HEAD, before the signed-in pass; the URL is still raw.
+sub madek_presentation_params_redirect {
+    if (req.restarts > 0 || req.http.Authorization || req.http.X-Madek-Authenticated) {
+        return;     # signed-in: passed later, untouched; restart: req.url was already processed
+    }
+    # HTML only (same folding as for anonymous requests in vcl_recv)
+    if ((req.http.Accept ~ "application/json" && req.http.Accept !~ "text/html")
+        || (req.http.Accept && req.http.Accept !~ "text/html|\*/\*|application/xhtml")
+        || req.url ~ "[?&]___sparse=") {
+        return;
+    }
+    if (req.url !~ "(?i)[?&]list(\[|%5B)(layout|show_filter|accordion)(\]|%5D)=") {
+        call madek_presentation_params_read_cookie;
+        return;
+    }
+
+    call madek_canonical_brackets;
+    unset req.http.X-Madek-Presentation;
+    if (req.url ~ "[?&]list%5Blayout%5D=[^&]") {
+        set req.http.X-Madek-Presentation = req.http.X-Madek-Presentation + "&list%5Blayout%5D="
+            + regsub(req.url, "^.*[?&]list%5Blayout%5D=([^&]*).*$", "\1");
+    }
+    if (req.url ~ "[?&]list%5Bshow_filter%5D=[^&]") {
+        set req.http.X-Madek-Presentation = req.http.X-Madek-Presentation + "&list%5Bshow_filter%5D="
+            + regsub(req.url, "^.*[?&]list%5Bshow_filter%5D=([^&]*).*$", "\1");
+    }
+    if (req.url ~ "[?&]list%5Baccordion%5D=[^&]") {
+        set req.http.X-Madek-Presentation = req.http.X-Madek-Presentation + "&list%5Baccordion%5D="
+            + regsub(req.url, "^.*[?&]list%5Baccordion%5D=([^&]*).*$", "\1");
+    }
+    set req.http.X-Madek-Presentation = regsub(req.http.X-Madek-Presentation, "^&", "");
+    # percent-encode JSON characters that clients may send raw (accordion is a JSON object)
+    set req.http.X-Madek-Presentation = regsuball(req.http.X-Madek-Presentation, "\{", "%7B");
+    set req.http.X-Madek-Presentation = regsuball(req.http.X-Madek-Presentation, "\}", "%7D");
+    set req.http.X-Madek-Presentation = regsuball(req.http.X-Madek-Presentation, "\x22", "%22");
+    set req.http.X-Madek-Presentation = regsuball(req.http.X-Madek-Presentation, ":", "%3A");
+    set req.http.X-Madek-Presentation = regsuball(req.http.X-Madek-Presentation, ",", "%2C");
+
+    set req.url = regsuball(req.url, "([?&])list%5B(layout|show_filter|accordion)%5D=[^&]*(?=&|$)", "\1");
+    call madek_tidy_query;
+    if (req.http.X-Madek-Presentation ~ ".") {
+        return (synth(751, "Found"));
+    }
+    # only empty presentation params: nothing to carry, continue with the cleaned URL
+}
+
+# The no-JS preference cookie, validated. Read before vcl_recv drops the Cookie header.
+sub madek_presentation_params_read_cookie {
+    if (req.http.Cookie !~ "(^|;\s*)madek_list=") {
+        return;
+    }
+    set req.http.X-Madek-List-Cookie = regsub(req.http.Cookie, "^(.*;\s*)?madek_list=([^;]*).*$", "\2");
+    # accept the form-encoded value (as set here or by the webapp) and the plain fragment form
+    set req.http.X-Madek-List-Cookie = regsuball(req.http.X-Madek-List-Cookie, "(?i)%3D", "=");
+    set req.http.X-Madek-List-Cookie = regsuball(req.http.X-Madek-List-Cookie, "(?i)%26", "&");
+    set req.http.X-Madek-List-Cookie = regsuball(req.http.X-Madek-List-Cookie, "(?i)\[|%5B", "%5B");
+    set req.http.X-Madek-List-Cookie = regsuball(req.http.X-Madek-List-Cookie, "(?i)\]|%5D", "%5D");
+    if (req.http.X-Madek-List-Cookie !~ "^.{1,1024}$"
+        || req.http.X-Madek-List-Cookie !~ "{{ madek_list_value_re }}") {
+        unset req.http.X-Madek-List-Cookie;
+    }
+}
+
+# Called in vcl_recv for anonymous requests, after URL normalisation and Accept folding.
+sub madek_presentation_params_cookie {
+    if (req.restarts > 0 || !req.http.X-Madek-List-Cookie
+        || req.http.Accept != "text/html" || req.url ~ "[?&]___sparse=") {
+        return;     # restart: the parameters were appended on the first pass already
+    }
+    if (req.url ~ "\?") {
+        set req.url = req.url + "&" + req.http.X-Madek-List-Cookie;
+    } else {
+        set req.url = req.url + "?" + req.http.X-Madek-List-Cookie;
+    }
+    set req.url = std.querysort(req.url);
+    # Direct requests with these parameters are redirected above, so a URL that carries them is
+    # only ever rendered for a cookie: the URL is the variant key (no extra hash_data needed).
+    if (req.http.X-Madek-List-Cookie ~ "list%5Baccordion%5D=") {
+        return (pass);
+    }
+}
+
+sub madek_presentation_params_synth {
+    if (resp.status == 751) {
+        set resp.status = 302;
+        set resp.reason = "Found";
+        set resp.http.Location = req.url + "#" + req.http.X-Madek-Presentation;
+        if (req.http.X-Madek-Presentation ~ "^.{1,1024}$"
+            && req.http.X-Madek-Presentation ~ "{{ madek_list_value_re }}") {
+            set resp.http.Set-Cookie = "madek_list="
+                + regsuball(regsuball(req.http.X-Madek-Presentation, "=", "%3D"), "&", "%26")
+                + "; Path=/; Max-Age={{ varnish_presentation_cookie_max_age | int }}; SameSite=Lax";   # @cfg PRESENTATION_COOKIE_MAX_AGE
+            if (req.http.X-Forwarded-Proto ~ "(?i)https") {
+                set resp.http.Set-Cookie = resp.http.Set-Cookie + "; Secure";
+            }
+        }
+        set resp.http.Cache-Control = "no-store";
+        set resp.http.X-Cache = "MISS";
+        set resp.http.X-Cache-Detail = "redirect";
+        set resp.body = "";
+        return (deliver);
+    }
+}
