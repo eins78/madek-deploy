@@ -206,5 +206,18 @@ expect "foreign key in cookie ignored" "$(hdr X-Cache-Key)" /sets/p3
 req '/sets/p3' -H 'Cookie: madek_list=list%5Blayout%5D%3Dlist' -H 'Accept: application/json'
 grep -q '"url":"/sets/p3"' <<<"$BODY" && ok "JSON request ignores the cookie" || bad "backend url: $BODY"
 
+echo "== list parameter bounds (varnish_list_param_bounds, 1..100 per page, pages 1..1000)"
+render "$TMP/f.vcl" '{"varnish_list_param_bounds": true}'; load f "$TMP/f.vcl"
+for q in 'list[per_page]=5000' 'list[per_page]=0' 'list%5Bpage%5D=0' 'list[page]=1001' 'list%5bpage%5d=abc' \
+         'list[page]=-1' 'list[page]=01' 'a=1&list[page]=99999'; do
+  req "/entries/f1?$q"; expect "$q: 400" "$CODE" 400
+done
+expect "synthetic, backend not asked" "$(count /entries/f1)" 0
+for q in 'list[per_page]=100' 'list[per_page]=1' 'list[page]=1000' 'list%5Bpage%5D=7&list%5Bper_page%5D=12' 'list[page]='; do
+  req "/entries/f2?$q"; expect "$q: 200" "$CODE" 200
+done
+req '/entries/f3?list[per_page]=5000' -H 'Cookie: madek-session=x'; expect "signed in, out of range: 200" "$CODE" 200
+expect "signed in: PASS" "$(hdr X-Cache)" PASS
+
 echo; echo "passed $PASS, failed $FAIL"
 [ $FAIL = 0 ]

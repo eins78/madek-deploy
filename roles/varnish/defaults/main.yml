@@ -84,5 +84,9 @@ varnish_presentation_params_redirect: false
 # Lifetime of the `madek_list` preference cookie (seconds, 30 days)
 varnish_presentation_cookie_max_age: 2592000
 
-# Reject absurd list[page] / list[per_page] for anonymous requests (off = not rendered)
+# Reject list pagination parameters outside the configured range for anonymous
+# requests (synthetic 400) before they reach the application. Signed-in users
+# are not affected.
 varnish_list_param_bounds: false
+varnish_max_per_page: 100
+varnish_max_page: 1000

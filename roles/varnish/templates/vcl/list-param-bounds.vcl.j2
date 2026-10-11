@@ -1,0 +1,57 @@
+###############################################################################
+### LIST PARAMETER BOUNDS (varnish_list_param_bounds) #########################
+###############################################################################
+#
+# Rejects list pagination parameters outside the configured range for anonymous requests before
+# they reach the application: list[per_page] must be 1..{{ varnish_max_per_page | int }}, list[page] 1..{{ varnish_max_page | int }}
+# (no leading zeros), otherwise a synthetic 400. Empty values are left alone (normalisation drops
+# them). Signed-in requests keep the application's own behaviour.
+{#- regex alternation matching the decimal integers 1..n without leading zeros -#}
+{% macro madek_int_range_re(n) -%}
+{%- set s = n | int | string -%}
+{%- set d = s | length -%}
+{%- set parts = [] -%}
+{%- if d > 1 -%}{%- set _ = parts.append('[1-9][0-9]{0,' ~ (d - 2) ~ '}') -%}{%- endif -%}
+{%- for i in range(d) -%}
+{%- set c = s[i] | int -%}
+{%- set lo = 1 if i == 0 else 0 -%}
+{%- if c > lo -%}
+{%- set _ = parts.append(s[:i] ~ '[' ~ lo ~ '-' ~ (c - 1) ~ ']' ~ (('[0-9]{' ~ (d - i - 1) ~ '}') if (d - i - 1) > 0 else '')) -%}
+{%- endif -%}
+{%- endfor -%}
+{%- set _ = parts.append(s) -%}
+{{ parts | join('|') }}
+{%- endmacro %}
+
+# Called in vcl_recv for every GET/HEAD, before the signed-in pass; the URL is still raw.
+sub madek_list_param_bounds {
+    if (req.restarts > 0 || req.http.Authorization || req.http.X-Madek-Authenticated) {
+        return;
+    }
+    if (req.url !~ "(?i)[?&]list(\[|%5B)(page|per_page)(\]|%5D)=") {
+        return;
+    }
+    # test a copy with canonical brackets; req.url itself is left as it is
+    set req.http.X-Madek-List-Url = regsuball(req.url, "(?i)\[|%5B", "%5B");
+    set req.http.X-Madek-List-Url = regsuball(req.http.X-Madek-List-Url, "(?i)\]|%5D", "%5D");
+    if (req.http.X-Madek-List-Url ~ "[?&]list%5Bper_page%5D=(?!(?:{{ madek_int_range_re(varnish_max_per_page) }})(?:&|$)|&|$)"     # @cfg MAX_PER_PAGE
+        || req.http.X-Madek-List-Url ~ "[?&]list%5Bpage%5D=(?!(?:{{ madek_int_range_re(varnish_max_page) }})(?:&|$)|&|$)") {   # @cfg MAX_PAGE
+        unset req.http.X-Madek-List-Url;
+        return (synth(752, "Bad Request"));
+    }
+    unset req.http.X-Madek-List-Url;
+}
+
+sub madek_list_param_bounds_synth {
+    if (resp.status == 752) {
+        set resp.status = 400;
+        set resp.reason = "Bad Request";
+        set resp.http.Content-Type = "text/plain; charset=utf-8";
+        set resp.http.Cache-Control = "no-store";
+        set resp.http.X-Cache = "MISS";
+        set resp.http.X-Cache-Detail = "rejected";
+        set resp.body = "list parameter out of range" + {"
+"};
+        return (deliver);
+    }
+}
