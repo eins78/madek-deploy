@@ -19,7 +19,8 @@ anubis_metrics_port: 9090
 anubis_difficulty: 4
 
 # The upstream service Anubis protects (the Madek webapp)
-anubis_target: "http://localhost:{{ madek_webapp_port }}"
+# (or Varnish in front of it when varnish_enabled, see roles/varnish)
+anubis_target: "{{ ('http://127.0.0.1:' ~ (varnish_port | default(6081))) if (varnish_enabled | default(false) | bool) else ('http://localhost:' ~ madek_webapp_port) }}"
 
 # Cookie domain for the Anubis challenge pass cookie.
 # Leave empty to use the request hostname. Set to your base domain
