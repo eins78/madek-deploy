@@ -1,0 +1,32 @@
+- name: reload systemd
+  systemd:
+    daemon_reload: yes
+
+- name: enable and start varnish service
+  service:
+    name: varnish
+    state: started
+    enabled: yes
+  register: varnish_started
+
+# Ports, storage or parameters changed: restart (the cache is emptied; Apache
+# answers 503 for the second or so Varnish is down).
+- name: restart varnish if the service definition changed
+  service:
+    name: varnish
+    state: restarted
+  when: varnish_dropin.changed and not varnish_started.changed
+
+# Only the VCL changed: reload (varnishreload compiles and activates it, the
+# cache is kept; on a compile error the active VCL stays in place).
+- name: reload varnish if the vcl changed
+  service:
+    name: varnish
+    state: reloaded
+  when: varnish_vcl.changed and not varnish_dropin.changed and not varnish_started.changed
+
+- name: wait for varnish
+  wait_for:
+    host: 127.0.0.1
+    port: "{{ varnish_port }}"
+    timeout: 60

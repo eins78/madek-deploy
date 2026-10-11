@@ -50,6 +50,8 @@
       tags:  [api-v2]
     - role: webstats
       tags: [webstats]
+    - role: varnish
+      tags: [varnish, reverse-proxy]
     - role: anubis
       tags: [anubis, reverse-proxy]
     - role: reverse-proxy-madek
