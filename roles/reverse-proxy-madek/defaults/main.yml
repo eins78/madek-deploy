@@ -4,6 +4,7 @@ reverse_proxy_ip_hash_seed: Null
 reverse_proxy_use_x_forwarded_for: false
 reverse_proxy_enable_cors: true
 reverse_proxy_desired_seo_bots: []
+reverse_proxy_disk_cache_enabled: true  # mod_cache_disk block in main.conf; set false when Varnish or public cache headers are used
 
 # ---------------------------------------------------------------------------
 # Geo whitelisting via DB-IP Lite Country (mod_maxminddb)
